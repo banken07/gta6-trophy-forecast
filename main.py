@@ -42,6 +42,17 @@ diminishing power-law growth after it) and it ONLY fires on provably
 flat history. On the final case, whose history is full of refreshes
 and real movement, the fitted trends dominate and the prior stays off.
 
+The spread is asymmetric, because a refresh only dilutes rates:
+players join faster than earners, so the lower tail is where the
+risk lives and the upper tail is bounded by ceilings and
+progression. The upside keeps the symmetric core spread. The
+downside adds a dilution tail built from the counts themselves: how
+far the tracked base could grow past its point forecast, and how low
+earners could sit if the players who join earn nothing. The stale
+prior's growth rate comes from ONE documented refresh, so it is
+treated as uncertain by about half in log space, not exact -- that
+uncertainty is what sizes the player leg of the tail.
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -186,8 +197,18 @@ STALE_TOTAL_CAP = 1000.0
 
 def forecast_players(times: list, players: list, h_target: float,
                      horizon_hours: float, stale: bool,
-                     freeze_hours: float) -> float:
-    """Tracked players at the target, from the counts series."""
+                     freeze_hours: float):
+    """Tracked players at the target, from the counts series.
+
+    Returns (p_target, p_hi): the point forecast and a high leg.
+    The growth leg is uncertain by about +-50% in log space -- the
+    stale prior is calibrated on ONE documented refresh, and the
+    log-time trend on one launch week -- so the high leg scales the
+    forecast growth factor by 1.5 in log space, capped like the point
+    forecast. p_hi exists so the rate spread can price the dilution
+    risk: if players grow faster than the point forecast, every rate
+    falls, and the lower tail must admit that.
+    """
     p_last = float(max(players[-1], 1))
     if stale:
         refresh_h = min(horizon_hours, STALE_REFRESH_HOURS)
@@ -197,7 +218,9 @@ def forecast_players(times: list, players: list, h_target: float,
         rest = horizon_hours - refresh_h
         if rest > 0:
             mult *= (1.0 + rest / 24.0) ** 1.5
-        return p_last * min(mult, STALE_TOTAL_CAP)
+        p_target = p_last * min(mult, STALE_TOTAL_CAP)
+        p_hi = p_last * min((p_target / p_last) ** 1.5, STALE_TOTAL_CAP)
+        return p_target, p_hi
     # Log-time fit: log players against log hours since release, the
     # house curve baseline's own clock. A rising base stays rising;
     # a flat one stays flat; a falling fit is clipped to flat, because
@@ -206,11 +229,13 @@ def forecast_players(times: list, players: list, h_target: float,
     ys = [math.log(max(p, 1)) for p in players]
     fit = least_squares(xs, ys)
     if fit is None:
-        return p_last
+        return p_last, p_last
     intercept, slope = fit
     slope = max(0.0, slope)
     p_target = math.exp(intercept + slope * math.log1p(h_target))
-    return max(p_last, min(p_target, p_last * STALE_TOTAL_CAP))
+    p_target = max(p_last, min(p_target, p_last * STALE_TOTAL_CAP))
+    p_hi = p_last * min((p_target / p_last) ** 1.5, STALE_TOTAL_CAP)
+    return p_target, p_hi
 
 
 # Progression classes. Each trophy is sorted into one class from its own
@@ -376,12 +401,16 @@ def forecast_counts(trophy: dict, e_last: float, p_last: float,
     A trophy at 100% is universal -- its earners stay equal to the
     tracked count, so its rate stays at 100%.
 
-    Returns (earners_at_target, class_uncertainty).
+    Returns (earners_at_target, class_uncertainty, earners_existing):
+    earners_existing is the existing cohort alone -- the earner floor
+    if the players who join between the last read and the target earn
+    nothing at all. It is the pessimistic earner leg the rate spread
+    prices against the optimistic player leg.
     """
     ceiling, tau, unc = CLASSES[classify(trophy)]
     rate0 = 100.0 * e_last / p_last if p_last > 0 else 0.0
     if rate0 >= 99.99:
-        return p_target, unc
+        return p_target, unc, p_target
     if rate0 > ceiling:
         ceiling = max(ceiling, min(0.92 * rate0, 95.0))
     # Existing cohort: logit pull toward the ceiling.
@@ -408,29 +437,65 @@ def forecast_counts(trophy: dict, e_last: float, p_last: float,
     exposure_days = (horizon_hours / 2.0) / 24.0
     share_new = ceiling * (1.0 - math.exp(-exposure_days / tau_tenure))
     e_new = max(0.0, p_target - p_last) * share_new / 100.0
-    return max(e_existing + e_new, e_last), unc
+    return max(e_existing + e_new, e_last), unc, max(e_existing, e_last)
 
 
-def forecast_one(trophy: dict, e_last, p_last, p_target, age_hours,
-                 horizon_days, horizon_hours, stale: bool) -> list:
-    """Five quantiles for one trophy at the target horizon."""
-    e_target, unc = forecast_counts(trophy, e_last, p_last, p_target,
-                                    age_hours, horizon_days, horizon_hours)
+def forecast_one(trophy: dict, e_last, p_last, p_target, p_hi,
+                 age_hours, horizon_days, horizon_hours,
+                 stale: bool) -> list:
+    """Five quantiles for one trophy at the target horizon.
+
+    The spread is ASYMMETRIC, because a refresh only dilutes rates:
+    players join faster than earners, so the rate's lower tail is
+    where the risk lives and the upper tail is bounded by ceilings
+    and progression. The upside keeps v2's symmetric core spread.
+    The downside adds a dilution tail, in logit units, built from
+    the counts themselves:
+
+        down_extra = log(p_hi / p_target) + log(e_target / e_floor)
+
+    The first term is the player-growth uncertainty: if the tracked
+    base grows to its high leg instead of its point forecast, every
+    rate falls by that factor. The second term is the earner floor:
+    if the players who join earn nothing, earners sit at the
+    existing cohort alone. Both legs are pessimistic corners of the
+    same event (a big refresh with slow earning), which is exactly
+    what a 5% tail should price. The tail loads mostly on q05 -- a
+    refresh is a jump event, not a gradual drift -- and half as much
+    on q25; q75/q95 are untouched. down_extra is capped at 3.0 logit
+    units (about a 20x combined dilution), past which the tail is
+    already far beyond any plausible refresh. A universal trophy
+    (median 100%) takes no dilution tail: its earners equal the
+    tracked count by definition, whatever the count does.
+    """
+    e_target, unc, e_floor = forecast_counts(
+        trophy, e_last, p_last, p_target,
+        age_hours, horizon_days, horizon_hours)
     median = 100.0 * e_target / p_target if p_target > 0 else 0.01
     centre = logit(median)
-    # Spread widens with the horizon like a random walk, plus the
-    # class uncertainty, plus a floor so even a 90-minute forecast is
-    # not absurdly certain. A stale page adds refresh uncertainty:
-    # the next refresh can move the counts a long way at once, and the
-    # quantiles must be wide enough to admit it.
+    # Core spread, as in v2: widens with the horizon like a random
+    # walk, plus the class uncertainty, plus a floor so even a
+    # 90-minute forecast is not absurdly certain. A stale page adds
+    # refresh uncertainty: the next refresh can move the counts a
+    # long way at once.
     spread = 0.12 + (0.30 + unc) * math.sqrt(horizon_days)
     if stale:
         spread += 0.25
     spread = min(spread, 2.2)
+    down_extra = 0.0
+    if median < 99.99:
+        down_extra = math.log(max(p_hi, p_target) / p_target)
+        down_extra += math.log(max(e_target, e_floor) / max(e_floor, 1e-9))
+        down_extra = min(down_extra, 3.0)
+    offsets = [-1.645 * spread - down_extra,
+               -0.674 * spread - 0.5 * down_extra,
+               0.0,
+               0.674 * spread,
+               1.645 * spread]
     out = []
     prev = -1.0
-    for z in Z:
-        value = round4(sigmoid(centre + z * spread))
+    for off in offsets:
+        value = round4(sigmoid(centre + off))
         value = max(prev, min(99.99, max(0.01, float(value))))
         out.append(value)
         prev = value
@@ -453,8 +518,8 @@ def forecast_case(case: dict, name: str) -> dict:
     horizon_days = case["horizon_minutes"] / 1440.0
     horizon_hours = case["horizon_minutes"] / 60.0
     stale = history_is_stale(case)
-    p_target = forecast_players(times, players, h_target, horizon_hours,
-                                stale, freeze_hours)
+    p_target, p_hi = forecast_players(times, players, h_target,
+                                      horizon_hours, stale, freeze_hours)
     p_last = float(max(players[-1], 1))
     rows = []
     for i, trophy in enumerate(case["trophies"]):
@@ -466,7 +531,7 @@ def forecast_case(case: dict, name: str) -> dict:
             ceiling = CLASSES[classify(trophy)][0]
             e_last = (0.5 if ceiling < 10 else 2.0) / 100.0 * p_last
         rows.append({"id": trophy["id"], "q": forecast_one(
-            trophy, e_last, p_last, p_target, age_hours,
+            trophy, e_last, p_last, p_target, p_hi, age_hours,
             horizon_days, horizon_hours, stale)})
     return {"trophies": rows}
 
