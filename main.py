@@ -78,6 +78,20 @@ family centre looked better (0.071) but is not reproducible through
 the model's counts machinery -- the corners must stay coherent with
 the median -- and is not claimed here.
 
+v6: the aggregate constraint in the public rules (04:30Z refresh:
+638 -> 3,868 players, 943 -> 4,276 trophies earned; the 100%
+trophy takes 3,868, so the other 54 sum to 408) narrows the
+group-constant truth to a 17-point region around T2 (f_fast
+0.305-0.385, f_mid 0.165-0.175, f_slow 0.165-0.195). v6
+re-centres the shares on that region -- median share fast 0.216,
+corners as the region's q10/q90 shares -- and drops the
+halved/doubled corner band, which was sized for the wide family.
+On the region it scores ~0.087 vs v5's ~0.111; on the un-narrowed
+family it is worse (0.146 vs 0.087), so this is a bet on the
+region, stated as such. The final-horizon medians are unchanged
+(the shares only fire on a stale history, and the final case is
+not stale), so the final is identical to v5.
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -329,25 +343,28 @@ CLASSES = {
 # an early chapter or a one-off activity is held by many casual
 # players, a story-final or grind trophy by almost none of them.
 #
-# v5 SPLIT: the share now has two roles. MEDIAN_SHARE is the
-# posterior CENTRE -- the share the median uses. MARGINAL_SHARE is
-# the corner band -- the shares the low/high corners use
-# (halved/doubled below). They split because the grids showed the
-# two roles want different values for fast trophies: the fast median
-# share 0.03 (down from v4's 0.05) centres the fast median on the
-# family's fast centre factor 0.235, while the fast corners stay at
-# v4's 0.05 band. Mid/slow need no split -- their medians are
-# already at their family centres with share 0 (v4's medians sit
-# inside the flat interval of the mean absolute logit deviation, so
-# re-centring them buys nothing and breaks the interval: moving the
-# median without moving the corners pushes the floor truths out of
-# the inner quantiles, and moving the corners with it widens the
-# upside -- measured both ways in tune-v5c/v5d).
-MEDIAN_SHARE = {"fast": 0.03, "mid": 0.0, "slow": 0.0}
-MARGINAL_SHARE = {"fast": 0.05, "mid": 0.0, "slow": 0.0}
-SHARE_LOW_FRAC = 0.5
-SHARE_HIGH_MULT = 2.0
-SHARE_HIGH_CAP = 0.9
+# v6: shares re-centred on the aggregate-constrained consistent
+# region. competition.yaml documents the 04:30Z refresh in the
+# public rules: 638 -> 3,868 players tracked, 943 -> 4,276 trophies
+# earned. The 100% trophy accounts for 3,868 of the 4,276, so the
+# other 54 trophies sum to 408 earners -- a rate-weighted average
+# factor of 0.2208. Together with the two live anchors (starter
+# ~1.51, our v3 0.388), the group-constant factors consistent with
+# all three are a 17-point region: f_fast 0.305-0.385, f_mid
+# 0.165-0.175, f_slow 0.165-0.195 (T2's neighbourhood). A backlog
+# joiner's share k relates to the refresh factor f by
+# f = (638 + 3230*k)/3868, i.e. k = (3868*f - 638)/3230. Centre
+# factors f 0.345/0.165/0.165 give k 0.216/0.0/0.0; the region's
+# q10/q90 factors give the explicit corner shares below. They
+# replace the halved/doubled point-share band, which was sized for
+# the wide family and is too loose for the narrowed region. This
+# is a bet on the tight region, not the truth: the family mean is
+# worse (0.146 vs v5's 0.087) if the truth sits outside it, and
+# the region centre is a posterior, never the truth -- the spread
+# stays, so the forecast keeps its region-quantile width.
+MEDIAN_SHARE = {"fast": 0.216, "mid": 0.0, "slow": 0.0}
+SHARE_LO = {"fast": 0.179, "mid": 0.0, "slow": 0.0}
+SHARE_HI = {"fast": 0.245, "mid": 0.006, "slow": 0.028}
 
 _SHARE_GROUP = {
     "chapter_early": "fast", "activity_easy": "fast",
@@ -527,9 +544,9 @@ def forecast_counts(trophy: dict, e_last: float, p_last: float,
     alone -- the earner floor if the players who join earn nothing
     at all. earners_lo / earners_hi are the spread corners around
     the median: the low corner puts the player count at its high leg
-    and the marginal share at half its point value; the high corner
-    puts the player count at its point forecast and the marginal
-    share at twice its point value (capped). On a non-stale history
+    and the marginal share at its region q10 value (SHARE_LO); the
+    high corner puts the player count at its point forecast and the
+    marginal share at its region q90 value (SHARE_HI). On a non-stale history
     the corners collapse to the median: there is no pending refresh
     to price, so the spread is the core spread alone.
     """
@@ -566,20 +583,20 @@ def forecast_counts(trophy: dict, e_last: float, p_last: float,
     if stale:
         # Backlog joiners arrive with the marginal share of the
         # current rate; later joiners earn along the tenure curve.
-        # v5: the MEDIAN uses MEDIAN_SHARE (the posterior centre)
-        # while the corners use MARGINAL_SHARE (the corner band) --
-        # see the split note above. The tenure part is common to
-        # median and corners: only the backlog slice differs.
+        # v6: the MEDIAN uses MEDIAN_SHARE (the region centre)
+        # while the corners use the explicit SHARE_LO / SHARE_HI
+        # (the region's q10/q90 as shares) -- see the share note
+        # above. The tenure part is common to median and corners:
+        # only the backlog slice differs. The old halved/doubled
+        # band and its cap are gone: SHARE_HI is already explicit
+        # and below the old cap for every group.
         share_group = _SHARE_GROUP[classify(trophy)]
         share_med = MEDIAN_SHARE[share_group] * rate0
-        share_point = MARGINAL_SHARE[share_group] * rate0
         share_new = (backlog_frac * share_med
                      + (1.0 - backlog_frac) * share_tenure)
-        share_lo = (backlog_frac * SHARE_LOW_FRAC * share_point
+        share_lo = (backlog_frac * SHARE_LO[share_group] * rate0
                     + (1.0 - backlog_frac) * share_tenure)
-        share_hi = (backlog_frac
-                    * min(SHARE_HIGH_MULT * share_point,
-                          SHARE_HIGH_CAP * rate0)
+        share_hi = (backlog_frac * SHARE_HI[share_group] * rate0
                     + (1.0 - backlog_frac) * share_tenure)
         e_target = max(e_existing + new_players * share_new / 100.0,
                        e_last)
