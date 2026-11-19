@@ -22,11 +22,21 @@ differently:
     their share moves toward the trophy's class ceiling in logit
     space, the same pull v1 used, over the horizon;
   * the players who join between the last read and the target earn
-    from scratch: their share follows a tenure curve whose time
-    constant is inferred from the trophy's own observed rate and the
-    player base's age (a trophy already held by many players after a
-    few hours is a fast trophy; one held by almost nobody is slow),
-    over the new joiners' average exposure, half the horizon.
+    along a tenure curve over their average exposure, half the
+    horizon, with the time constant inferred from the trophy's own
+    observed rate -- BUT only for the joiners who are genuinely new
+    players. When the page is stale, most joiners are not new
+    players at all: they are a backlog of late syncers, players who
+    already own the game and have played, whose profiles Exophase
+    only just scanned. A late syncer arrives already holding the
+    trophy at a fraction -- the marginal share -- of the current
+    average rate, not at zero. The two regimes cross over with the
+    horizon: at a refresh the joiners are (nearly) all backlog, so
+    the marginal share governs; over days the backlog is a small
+    slice of all joiners and the tenure curve governs the rest. The
+    backlog fraction is the first refresh's jump over the total
+    growth, so the mix is continuous in the horizon, never a switch
+    at 90 minutes.
 
 The stale-page rule: when every read in the history is byte-identical
 (same tracked count, same rates), the page is not telling us nothing
@@ -42,16 +52,19 @@ diminishing power-law growth after it) and it ONLY fires on provably
 flat history. On the final case, whose history is full of refreshes
 and real movement, the fitted trends dominate and the prior stays off.
 
-The spread is asymmetric, because a refresh only dilutes rates:
-players join faster than earners, so the lower tail is where the
-risk lives and the upper tail is bounded by ceilings and
-progression. The upside keeps the symmetric core spread. The
-downside adds a dilution tail built from the counts themselves: how
-far the tracked base could grow past its point forecast, and how low
-earners could sit if the players who join earn nothing. The stale
-prior's growth rate comes from ONE documented refresh, so it is
-treated as uncertain by about half in log space, not exact -- that
-uncertainty is what sizes the player leg of the tail.
+The median bets on the refresh landing. When the page has sat frozen
+for about as long as the documented refresh cadence, the target sits
+past the next refresh, and the median is the post-refresh rate -- the
+marginal-share dilution, not the stale rate. That is a deliberate
+structural bet, the one the board's best entries make ("calibrated
+launch-refresh prior"): a forecast whose median waits for the
+refresh pays the full dilution at every trophy. The spread then
+prices only the residual uncertainty: how far the marginal share and
+the player count sit from their point values, as corners around the
+median -- not the old tail that assumed the median itself might be
+anywhere. A universal trophy (median 100%) takes no dilution tail:
+its earners equal the tracked count by definition, whatever the
+count does.
 
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
@@ -200,14 +213,18 @@ def forecast_players(times: list, players: list, h_target: float,
                      freeze_hours: float):
     """Tracked players at the target, from the counts series.
 
-    Returns (p_target, p_hi): the point forecast and a high leg.
-    The growth leg is uncertain by about +-50% in log space -- the
-    stale prior is calibrated on ONE documented refresh, and the
-    log-time trend on one launch week -- so the high leg scales the
-    forecast growth factor by 1.5 in log space, capped like the point
-    forecast. p_hi exists so the rate spread can price the dilution
-    risk: if players grow faster than the point forecast, every rate
-    falls, and the lower tail must admit that.
+    Returns (p_target, p_hi, jump): the point forecast, a high leg,
+    and the first refresh's own multiplier (1.0 when the history is
+    not stale). The growth leg is uncertain by about +-50% in log
+    space -- the stale prior is calibrated on ONE documented refresh,
+    and the log-time trend on one launch week -- so the high leg
+    scales the forecast growth factor by 1.5 in log space, capped
+    like the point forecast. p_hi exists so the rate spread can price
+    the dilution risk: if players grow faster than the point
+    forecast, every rate falls, and the lower tail must admit that.
+    jump exists so the earner forecast can tell backlog apart from
+    new players: the backlog is the first refresh's jump, everything
+    after it is new players.
     """
     p_last = float(max(players[-1], 1))
     if stale:
@@ -220,7 +237,7 @@ def forecast_players(times: list, players: list, h_target: float,
             mult *= (1.0 + rest / 24.0) ** 1.5
         p_target = p_last * min(mult, STALE_TOTAL_CAP)
         p_hi = p_last * min((p_target / p_last) ** 1.5, STALE_TOTAL_CAP)
-        return p_target, p_hi
+        return p_target, p_hi, jump
     # Log-time fit: log players against log hours since release, the
     # house curve baseline's own clock. A rising base stays rising;
     # a flat one stays flat; a falling fit is clipped to flat, because
@@ -229,13 +246,13 @@ def forecast_players(times: list, players: list, h_target: float,
     ys = [math.log(max(p, 1)) for p in players]
     fit = least_squares(xs, ys)
     if fit is None:
-        return p_last, p_last
+        return p_last, p_last, 1.0
     intercept, slope = fit
     slope = max(0.0, slope)
     p_target = math.exp(intercept + slope * math.log1p(h_target))
     p_target = max(p_last, min(p_target, p_last * STALE_TOTAL_CAP))
     p_hi = p_last * min((p_target / p_last) ** 1.5, STALE_TOTAL_CAP)
-    return p_target, p_hi
+    return p_target, p_hi, 1.0
 
 
 # Progression classes. Each trophy is sorted into one class from its own
@@ -288,6 +305,38 @@ CLASSES = {
     # small slice of tracked players ever gets there, and in week one
     # almost nobody is close, however high the launch-night rate reads.
     "platinum": (1.6, 30.0, 0.30),
+}
+
+# Marginal share: the fraction of the current average rate at which a
+# late-syncing player (the backlog a refresh reveals) already holds a
+# trophy. A player who has owned the game for days but only just
+# synced is not a new player: they arrive with trophies. But they are
+# far less engaged than the first syncers -- the launch-night page
+# shows the keenest players first -- so their share is a fraction of
+# the average, and the fraction depends on how fast the trophy is:
+# an early chapter or a one-off activity is held by many casual
+# players, a story-final or grind trophy by almost none of them.
+# The values are calibrated on the two live anchors the board gives
+# (the house starter's practice loss ~1.51 with typical miss ~0.68pp,
+# and our v3's live loss 0.388 with miss 0.31pp): together they pin
+# the average post-refresh factor to about 0.20 of the last rate, with
+# fast trophies higher and slow ones at the pure-dilution floor, and
+# the three group values below are the robust centre of that family
+# (see judge-v4.py's grid: the loss is flat across the family, so no
+# sharper claim is made). The spread prices the band around them:
+# the low corner halves the share, the high corner doubles it.
+MARGINAL_SHARE = {"fast": 0.05, "mid": 0.0, "slow": 0.0}
+SHARE_LOW_FRAC = 0.5
+SHARE_HIGH_MULT = 2.0
+SHARE_HIGH_CAP = 0.9
+
+_SHARE_GROUP = {
+    "chapter_early": "fast", "activity_easy": "fast",
+    "chapter_mid": "mid", "chapter_late": "mid",
+    "story_mission": "mid", "activity_mid": "mid",
+    "strand_final": "mid",
+    "story_final": "slow", "grind_mid": "slow",
+    "grind_hard": "slow", "platinum": "slow",
 }
 
 # Phrases that mark a grind, checked before the easier classes. The
@@ -385,32 +434,60 @@ def tenure_tau(rate_pct: float, ceiling: float, age_hours: float):
     return tau_hours / 24.0
 
 
+def corner_players(p_target: float, p_last: float) -> float:
+    """High leg of the player count for the spread corners: the point
+    forecast grown by a quarter of its own log growth. The stale
+    prior's point forecast is already nearly the documented refresh,
+    so the corner prices a modest overshoot, not the +-50% log leg
+    the generic high leg carries (that leg belongs to multi-day
+    trend uncertainty, not to a refresh that is due within hours)."""
+    if p_target <= p_last:
+        return p_target
+    return p_target * (p_target / p_last) ** 0.25
+
+
 def forecast_counts(trophy: dict, e_last: float, p_last: float,
-                    p_target: float, age_hours: float,
-                    horizon_days: float, horizon_hours: float):
+                    p_target: float, p_hi: float, age_hours: float,
+                    horizon_days: float, horizon_hours: float,
+                    stale: bool, backlog_frac: float):
     """Median earners at the target, in counts, from two cohorts.
 
     Existing cohort (the players already tracked): their share moves
     toward the class ceiling in logit space over the horizon -- the
     v1 pull, kept because it is gentle at low rates and strong near
     the ceiling. New cohort (the players who join between the last
-    read and the target): their share follows the tenure curve over
-    their average exposure, half the horizon, with the time constant
-    inferred from the trophy's own observed rate. Earners never
-    decrease: the result is floored at the last observed earners.
-    A trophy at 100% is universal -- its earners stay equal to the
-    tracked count, so its rate stays at 100%.
+    read and the target): two regimes, mixed by backlog_frac -- the
+    share of the joining players who arrive at the first refresh,
+    i.e. the backlog of late syncers. A backlog joiner arrives
+    already holding the trophy at the marginal share of the current
+    average rate (they played before they synced, just less keenly
+    than the first syncers). A later joiner is a genuinely new
+    player and earns along the tenure curve over their average
+    exposure, half the horizon, with the time constant inferred from
+    the trophy's own observed rate. On a stale page with a short
+    horizon the backlog is everything (backlog_frac 1), so the
+    median is the post-refresh dilution; over days the backlog is a
+    small slice and the tenure curve governs the rest, so a long
+    horizon keeps the v2/v3 final medians. Earners never decrease:
+    the result is floored at the last observed earners. A trophy at
+    100% is universal -- its earners stay equal to the tracked
+    count, so its rate stays at 100%.
 
-    Returns (earners_at_target, class_uncertainty, earners_existing):
-    earners_existing is the existing cohort alone -- the earner floor
-    if the players who join between the last read and the target earn
-    nothing at all. It is the pessimistic earner leg the rate spread
-    prices against the optimistic player leg.
+    Returns (earners_at_target, class_uncertainty, earners_existing,
+    earners_lo, earners_hi): earners_existing is the existing cohort
+    alone -- the earner floor if the players who join earn nothing
+    at all. earners_lo / earners_hi are the spread corners around
+    the median: the low corner puts the player count at its high leg
+    and the marginal share at half its point value; the high corner
+    puts the player count at its point forecast and the marginal
+    share at twice its point value (capped). On a non-stale history
+    the corners collapse to the median: there is no pending refresh
+    to price, so the spread is the core spread alone.
     """
     ceiling, tau, unc = CLASSES[classify(trophy)]
     rate0 = 100.0 * e_last / p_last if p_last > 0 else 0.0
     if rate0 >= 99.99:
-        return p_target, unc, p_target
+        return p_target, unc, p_target, p_target, p_target
     if rate0 > ceiling:
         ceiling = max(ceiling, min(0.92 * rate0, 95.0))
     # Existing cohort: logit pull toward the ceiling.
@@ -435,63 +512,95 @@ def forecast_counts(trophy: dict, e_last: float, p_last: float,
         tau_tenure = math.exp(weight * math.log(tau_tenure)
                               + (1.0 - weight) * math.log(tau))
     exposure_days = (horizon_hours / 2.0) / 24.0
-    share_new = ceiling * (1.0 - math.exp(-exposure_days / tau_tenure))
-    e_new = max(0.0, p_target - p_last) * share_new / 100.0
-    return max(e_existing + e_new, e_last), unc, max(e_existing, e_last)
+    share_tenure = ceiling * (1.0 - math.exp(-exposure_days / tau_tenure))
+    new_players = max(0.0, p_target - p_last)
+    if stale:
+        # Backlog joiners arrive with the marginal share of the
+        # current rate; later joiners earn along the tenure curve.
+        share_group = _SHARE_GROUP[classify(trophy)]
+        share_point = MARGINAL_SHARE[share_group] * rate0
+        share_new = (backlog_frac * share_point
+                     + (1.0 - backlog_frac) * share_tenure)
+        share_lo = (backlog_frac * SHARE_LOW_FRAC * share_point
+                    + (1.0 - backlog_frac) * share_tenure)
+        share_hi = (backlog_frac
+                    * min(SHARE_HIGH_MULT * share_point,
+                          SHARE_HIGH_CAP * rate0)
+                    + (1.0 - backlog_frac) * share_tenure)
+        e_target = max(e_existing + new_players * share_new / 100.0,
+                       e_last)
+        e_lo = max(e_existing
+                   + max(0.0, corner_players(p_target, p_last) - p_last)
+                   * share_lo / 100.0, e_last)
+        e_hi = max(e_existing + new_players * share_hi / 100.0, e_last)
+    else:
+        e_target = max(e_existing + new_players * share_tenure / 100.0,
+                       e_last)
+        e_lo = e_target
+        e_hi = e_target
+    e_floor = max(e_existing, e_last)
+    return e_target, unc, e_floor, e_lo, e_hi
 
 
 def forecast_one(trophy: dict, e_last, p_last, p_target, p_hi,
                  age_hours, horizon_days, horizon_hours,
-                 stale: bool) -> list:
+                 stale: bool, backlog_frac: float) -> list:
     """Five quantiles for one trophy at the target horizon.
 
     The spread is ASYMMETRIC, because a refresh only dilutes rates:
     players join faster than earners, so the rate's lower tail is
     where the risk lives and the upper tail is bounded by ceilings
-    and progression. The upside keeps v2's symmetric core spread.
-    The downside adds a dilution tail, in logit units, built from
-    the counts themselves:
-
-        down_extra = log(p_hi / p_target) + log(e_target / e_floor)
-
-    The first term is the player-growth uncertainty: if the tracked
-    base grows to its high leg instead of its point forecast, every
-    rate falls by that factor. The second term is the earner floor:
-    if the players who join earn nothing, earners sit at the
-    existing cohort alone. Both legs are pessimistic corners of the
-    same event (a big refresh with slow earning), which is exactly
-    what a 5% tail should price. The tail loads mostly on q05 -- a
-    refresh is a jump event, not a gradual drift -- and half as much
-    on q25; q75/q95 are untouched. down_extra is capped at 3.0 logit
-    units (about a 20x combined dilution), past which the tail is
-    already far beyond any plausible refresh. A universal trophy
-    (median 100%) takes no dilution tail: its earners equal the
-    tracked count by definition, whatever the count does.
+    and progression. The upside keeps the symmetric core spread.
+    The tails are corners around the median, not the old tail that
+    assumed the median itself might be anywhere: the low corner is
+    the player count at its corner leg (a quarter of the forecast
+    growth past the point forecast) with the marginal share halved,
+    the high corner is the player count at its point forecast with
+    the marginal share doubled. On a non-stale history the corners
+    collapse to the median and the spread is the core spread plus
+    the v3 dilution tail (players past the point forecast, earners
+    at the existing cohort alone) -- there is no pending refresh to
+    price, so the old tail is the right one there. The corners load
+    mostly on the outer quantiles -- a refresh is a jump event, not
+    a gradual drift -- and half as much on the inner ones; both are
+    capped at 3.0 logit units, past which the tail is already far
+    beyond any plausible refresh. A universal trophy (median 100%)
+    takes no tail: its earners equal the tracked count by
+    definition, whatever the count does.
     """
-    e_target, unc, e_floor = forecast_counts(
-        trophy, e_last, p_last, p_target,
-        age_hours, horizon_days, horizon_hours)
+    e_target, unc, e_floor, e_lo, e_hi = forecast_counts(
+        trophy, e_last, p_last, p_target, p_hi,
+        age_hours, horizon_days, horizon_hours, stale, backlog_frac)
     median = 100.0 * e_target / p_target if p_target > 0 else 0.01
     centre = logit(median)
-    # Core spread, as in v2: widens with the horizon like a random
-    # walk, plus the class uncertainty, plus a floor so even a
-    # 90-minute forecast is not absurdly certain. A stale page adds
-    # refresh uncertainty: the next refresh can move the counts a
-    # long way at once.
+    # Core spread: widens with the horizon like a random walk, plus
+    # the class uncertainty, plus a floor so even a 90-minute
+    # forecast is not absurdly certain. There is NO stale bonus any
+    # more: the refresh uncertainty now lives in the corners below,
+    # not in the core -- the core is generic drift, and the median
+    # already prices the refresh landing.
     spread = 0.12 + (0.30 + unc) * math.sqrt(horizon_days)
-    if stale:
-        spread += 0.25
     spread = min(spread, 2.2)
     down_extra = 0.0
+    up_extra = 0.0
     if median < 99.99:
-        down_extra = math.log(max(p_hi, p_target) / p_target)
-        down_extra += math.log(max(e_target, e_floor) / max(e_floor, 1e-9))
-        down_extra = min(down_extra, 3.0)
+        if stale:
+            p_corner = corner_players(p_target, p_last)
+            rate_lo = 100.0 * e_lo / p_corner if p_corner > 0 else median
+            rate_hi = 100.0 * e_hi / p_target if p_target > 0 else median
+            down_extra = math.log(max(median, 0.01) / max(rate_lo, 0.01))
+            up_extra = math.log(max(rate_hi, 0.01) / max(median, 0.01))
+        else:
+            down_extra = math.log(max(p_hi, p_target) / p_target)
+            down_extra += math.log(max(e_target, e_floor)
+                                   / max(e_floor, 1e-9))
+        down_extra = min(max(down_extra, 0.0), 3.0)
+        up_extra = min(max(up_extra, 0.0), 3.0)
     offsets = [-1.645 * spread - down_extra,
                -0.674 * spread - 0.5 * down_extra,
                0.0,
-               0.674 * spread,
-               1.645 * spread]
+               0.674 * spread + 0.5 * up_extra,
+               1.645 * spread + up_extra]
     out = []
     prev = -1.0
     for off in offsets:
@@ -518,9 +627,20 @@ def forecast_case(case: dict, name: str) -> dict:
     horizon_days = case["horizon_minutes"] / 1440.0
     horizon_hours = case["horizon_minutes"] / 60.0
     stale = history_is_stale(case)
-    p_target, p_hi = forecast_players(times, players, h_target,
-                                      horizon_hours, stale, freeze_hours)
+    p_target, p_hi, jump = forecast_players(times, players, h_target,
+                                            horizon_hours, stale,
+                                            freeze_hours)
     p_last = float(max(players[-1], 1))
+    # Backlog fraction: the share of the joining players who arrive
+    # at the first refresh (late syncers) rather than later (new
+    # players). It is the first refresh's jump over the total
+    # growth -- 1 when the whole horizon is one refresh, small when
+    # the horizon holds many refreshes worth of growth.
+    if stale and p_target > p_last:
+        backlog_frac = (jump - 1.0) / (p_target / p_last - 1.0)
+        backlog_frac = min(1.0, max(0.0, backlog_frac))
+    else:
+        backlog_frac = 0.0
     rows = []
     for i, trophy in enumerate(case["trophies"]):
         series = earners[i]
@@ -532,7 +652,7 @@ def forecast_case(case: dict, name: str) -> dict:
             e_last = (0.5 if ceiling < 10 else 2.0) / 100.0 * p_last
         rows.append({"id": trophy["id"], "q": forecast_one(
             trophy, e_last, p_last, p_target, p_hi, age_hours,
-            horizon_days, horizon_hours, stale)})
+            horizon_days, horizon_hours, stale, backlog_frac)})
     return {"trophies": rows}
 
 
