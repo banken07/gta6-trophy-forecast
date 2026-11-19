@@ -1,28 +1,51 @@
-"""Forecast GTA VI trophy earn rates at a case's target, horizon-aware.
+"""Forecast GTA VI trophy earn rates at a case's target, in counts.
 
 Reads every <id>.in in the input directory and writes <id>.out with one
 row per trophy: five quantiles (0.05, 0.25, 0.5, 0.75, 0.95) of the
 trophy's earn rate (percent of tracked players) at the target time.
 
-Why not persistence: the house baseline forecasts the last observed rate
-forever. That is fine over 90 minutes, but the final case spans about
-4.5 days of launch week, over which three things move every rate:
+A rate is a ratio, so this forecasts its two counts separately:
 
-  * players progress through the story and activities, so rare trophies
-    climb toward a trophy-specific ceiling;
-  * the tracked-player base explodes as launch week proceeds, diluting
-    rates that start near 100% (a trophy every early player has is not
-    one every later player has yet);
-  * grind trophies (250 stunts, 100% completion, gold medals everywhere)
-    barely move at all in a week, however fast the story trophies rise.
+    rate(target) = EARNERS(target) / PLAYERS(target)
 
-So each trophy is classified from its own tier, points and description
-text into a progression class with a ceiling rate and a time constant,
-and its median is pulled from the last observed rate toward that ceiling
-in logit space, by a fraction that grows with the horizon. The spread
-widens with the horizon and with how uncertain the class is. History
-movement, when the case has any, nudges the drift; flat history (as in
-the practice cases) leaves the class model in charge.
+PLAYERS is Exophase's tracked-player count. It grows through launch
+week as more players sync their profiles, and it grows in JUMPS: the
+page sits unchanged for hours and then refreshes to a much larger
+count. PLAYERS is therefore forecast in log-time (a least-squares fit
+of log players against log hours since release), which smooths the
+jumps into a trend.
+
+EARNERS is forecast in two cohorts, because the two groups behave
+differently:
+
+  * the players already tracked at the last read keep progressing:
+    their share moves toward the trophy's class ceiling in logit
+    space, the same pull v1 used, over the horizon;
+  * the players who join between the last read and the target earn
+    from scratch: their share follows a tenure curve whose time
+    constant is inferred from the trophy's own observed rate and the
+    player base's age (a trophy already held by many players after a
+    few hours is a fast trophy; one held by almost nobody is slow),
+    over the new joiners' average exposure, half the horizon.
+
+The stale-page rule: when every read in the history is byte-identical
+(same tracked count, same rates), the page is not telling us nothing
+is happening -- it is telling us it has not refreshed. A frozen page
+means a refresh is coming, and the refresh reveals all the joining
+that happened while it was frozen. The house documents exactly one
+such refresh (competition.yaml): frozen 23:48-04:00Z on launch night,
+then refreshed at 04:30Z with the tracked count up 638 -> 3,868, a
+factor of 6.06 over about 4.7 hours of frozen page. The stale prior
+below is calibrated on that documented refresh (log growth 0.383 per
+hour over the frozen span plus the horizon to the next refresh, then
+diminishing power-law growth after it) and it ONLY fires on provably
+flat history. On the final case, whose history is full of refreshes
+and real movement, the fitted trends dominate and the prior stays off.
+
+One special case: a trophy at 100% (every tracked player holds it,
+to the two decimals Exophase prints) is earned on arrival -- new
+players hold it as fast as they appear in the count -- so its
+earners stay equal to the tracked count and its rate stays at 100%.
 
 Run: mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
 """
@@ -31,6 +54,7 @@ import json
 import math
 import os
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -67,13 +91,139 @@ def round4(x: float):
     return int(value) if value.is_integer() else value
 
 
+# ---------------------------------------------------------------- counts
+#
+# Everything below works in counts, not rates. A case's history is a
+# list of reads; each read carries the tracked-player count and every
+# trophy's rate (percent, to two decimals). Earners for trophy i in a
+# read are rate/100 * players. Rates are quantised to 0.01 points, so
+# earners are quantised too (at 638 tracked players, one hundredth of
+# a point is 0.06 players); the model never trusts the last digit.
+
+
+def parse_time(iso: str) -> datetime:
+    return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+
+
+def hours_between(later: datetime, earlier: datetime) -> float:
+    """Hours from earlier to later, floored at 0.05: a read stamped
+    just before the release date still counts as just after it."""
+    return max(0.05, (later - earlier).total_seconds() / 3600.0)
+
+
+def least_squares(xs: list, ys: list):
+    """(intercept, slope) of the least-squares line, or None when the
+    x values carry no variance."""
+    n = len(xs)
+    if n < 2:
+        return None
+    mean_x = sum(xs) / n
+    mean_y = sum(ys) / n
+    den = sum((x - mean_x) ** 2 for x in xs)
+    if den == 0:
+        return None
+    slope = sum((x - mean_x) * (y - mean_y)
+                for x, y in zip(xs, ys)) / den
+    return mean_y - slope * mean_x, slope
+
+
+def case_series(case: dict):
+    """Split a case into its counts series.
+
+    Returns (origin, h_target, times, players, earners) where origin
+    is midnight UTC on the release date, h_target is the target's age
+    in hours, times are each read's age in hours, players are the
+    tracked counts, and earners[i] is the list of (age, earners) pairs
+    for trophy i over the reads where its rate was present.
+    """
+    origin = parse_time(case["game"]["release_date"] + "T00:00:00Z")
+    h_target = hours_between(parse_time(case["target"]), origin)
+    times = []
+    players = []
+    earners = [[] for _ in case["trophies"]]
+    for read in case["history"]:
+        age = hours_between(parse_time(read["at"]), origin)
+        count = read["players_tracked"]
+        times.append(age)
+        players.append(count)
+        for i, rate in enumerate(read["rates"]):
+            if rate is not None:
+                earners[i].append((age, rate / 100.0 * count))
+    return origin, h_target, times, players, earners
+
+
+def history_is_stale(case: dict) -> bool:
+    """True when the page never moved: every read has the same tracked
+    count and every trophy the same rate. That is the stale-page
+    signature the house documents for launch night, not evidence of
+    stasis -- the page was frozen, the players were not."""
+    players = [r["players_tracked"] for r in case["history"]]
+    if len(set(players)) != 1:
+        return False
+    for i in range(len(case["trophies"])):
+        seen = {r["rates"][i] for r in case["history"]
+                if r["rates"][i] is not None}
+        if len(seen) > 1:
+            return False
+    return True
+
+
+# The stale-page prior, calibrated on the one refresh the house
+# documents (competition.yaml): the page frozen from 23:48Z, refreshed
+# at 04:30Z, tracked count 638 -> 3,868 (x6.06) over about 4.7 hours
+# of frozen page. Log growth over that window is ln(6.06)/4.7 = 0.383
+# per hour. The prior says: the next refresh, expected within
+# STALE_REFRESH_HOURS, reveals growth at that rate over the frozen
+# span plus the time to the refresh; after the refresh, growth
+# continues at the diminishing power-law pace of a launch week
+# (doubling slows as the week goes on). Both legs are capped so a
+# long horizon can never turn the prior into fantasy.
+STALE_GAMMA = 0.383
+STALE_REFRESH_HOURS = 6.0
+STALE_JUMP_CAP = 12.0
+STALE_TOTAL_CAP = 1000.0
+
+
+def forecast_players(times: list, players: list, h_target: float,
+                     horizon_hours: float, stale: bool,
+                     freeze_hours: float) -> float:
+    """Tracked players at the target, from the counts series."""
+    p_last = float(max(players[-1], 1))
+    if stale:
+        refresh_h = min(horizon_hours, STALE_REFRESH_HOURS)
+        jump = math.exp(STALE_GAMMA * (freeze_hours + refresh_h))
+        jump = min(jump, STALE_JUMP_CAP)
+        mult = jump
+        rest = horizon_hours - refresh_h
+        if rest > 0:
+            mult *= (1.0 + rest / 24.0) ** 1.5
+        return p_last * min(mult, STALE_TOTAL_CAP)
+    # Log-time fit: log players against log hours since release, the
+    # house curve baseline's own clock. A rising base stays rising;
+    # a flat one stays flat; a falling fit is clipped to flat, because
+    # a tracked count is cumulative in expectation.
+    xs = [math.log1p(h) for h in times]
+    ys = [math.log(max(p, 1)) for p in players]
+    fit = least_squares(xs, ys)
+    if fit is None:
+        return p_last
+    intercept, slope = fit
+    slope = max(0.0, slope)
+    p_target = math.exp(intercept + slope * math.log1p(h_target))
+    return max(p_last, min(p_target, p_last * STALE_TOTAL_CAP))
+
+
 # Progression classes. Each trophy is sorted into one class from its own
 # tier, points and description text (never from a hardcoded trophy id).
 # A class carries:
 #   ceiling -- the share of tracked players who will ever earn the
-#              trophy, once the game has been out long enough (percent);
-#   tau     -- time constant in days: how fast the rate closes on the
-#              ceiling while players are still in their first weeks;
+#              trophy, once the game has been out long enough (percent).
+#              It caps both cohorts: the existing players' share
+#              pulls toward it, and the new joiners' tenure curve
+#              saturates at it;
+#   tau     -- time constant in days for the existing cohort's pull
+#              toward the ceiling, and the fallback when a trophy's
+#              own tenure curve cannot be inferred from its rate;
 #   unc     -- extra spread for this class, in logit units per root day,
 #              on top of the base spread: grinds are the least predictable.
 #
@@ -182,83 +332,100 @@ def classify(trophy: dict) -> str:
     return "activity_easy"
 
 
-def last_rate(history: list, i: int):
-    """Last non-null rate for trophy i, or None when never observed."""
-    for read in reversed(history):
-        rate = read["rates"][i]
-        if rate is not None:
-            return rate
-    return None
+def tenure_tau(rate_pct: float, ceiling: float, age_hours: float):
+    """Time constant (days) for a trophy's tenure curve, inferred
+    from its own observed rate.
 
+    Assume a player who has been around t hours holds the trophy
+    with probability ceiling * (1 - exp(-t/tau)) -- a saturating
+    tenure curve -- and that the tracked population's tenures are
+    spread roughly evenly over [0, age], so the observed rate is the
+    curve at the average tenure, age/2. Solving for tau:
 
-def history_drift(history: list, i: int) -> float:
-    """Observed logit drift per day for trophy i, shrunk toward zero.
+        tau = -(age/2) / ln(1 - rate/ceiling)
 
-    Fits a line through the logit of the observed rates against read
-    time. With flat history (every read identical, as in the practice
-    cases) this is exactly zero. With real movement it is shrunk by a
-    factor of four and capped, because a launch-night slope measured
-    over hours is mostly noise and early-adopter rush, not a rate that
-    holds for four more days.
+    A trophy already held by many players after a few hours is fast
+    (small tau); one held by almost nobody after the same time is
+    slow (large tau). Returns None when the rate is already at or
+    above the ceiling (the class time constant is used instead), and
+    infinity when the rate is zero (nobody has it yet, so the new
+    cohort is not expected to either).
     """
-    points = []
-    for read in history:
-        rate = read["rates"][i]
-        if rate is None:
-            continue
-        points.append((read["at"], logit(rate)))
-    if len(points) < 2:
-        return 0.0
-    if len({t for t, _ in points}) < 2:
-        return 0.0
-    # Read times are ISO strings; sort order is chronological order,
-    # and the spacing between reads is near-uniform, so index time is
-    # a fair clock. Convert index steps to days from the read count and
-    # the case's own span instead of parsing timestamps.
-    n = len(points)
-    mean_x = (n - 1) / 2.0
-    mean_y = sum(y for _, y in points) / n
-    num = sum((k - mean_x) * (y - mean_y) for k, (_, y) in enumerate(points))
-    den = sum((k - mean_x) ** 2 for k in range(n))
-    if den == 0:
-        return 0.0
-    # Slope per read step; a step is roughly half an hour in the early
-    # recording, so scale to per-day and shrink hard.
-    slope_per_day = (num / den) * 48.0
-    shrunk = 0.25 * slope_per_day
-    return max(-0.6, min(0.6, shrunk))
+    if rate_pct <= 0:
+        return float("inf")
+    if rate_pct >= ceiling:
+        return None
+    share = rate_pct / ceiling
+    tau_hours = -(age_hours / 2.0) / math.log(1.0 - share)
+    return tau_hours / 24.0
 
 
-def forecast_one(trophy: dict, rate0, drift: float, horizon_days: float) -> list:
-    """Five quantiles for one trophy at the target horizon."""
+def forecast_counts(trophy: dict, e_last: float, p_last: float,
+                    p_target: float, age_hours: float,
+                    horizon_days: float, horizon_hours: float):
+    """Median earners at the target, in counts, from two cohorts.
+
+    Existing cohort (the players already tracked): their share moves
+    toward the class ceiling in logit space over the horizon -- the
+    v1 pull, kept because it is gentle at low rates and strong near
+    the ceiling. New cohort (the players who join between the last
+    read and the target): their share follows the tenure curve over
+    their average exposure, half the horizon, with the time constant
+    inferred from the trophy's own observed rate. Earners never
+    decrease: the result is floored at the last observed earners.
+    A trophy at 100% is universal -- its earners stay equal to the
+    tracked count, so its rate stays at 100%.
+
+    Returns (earners_at_target, class_uncertainty).
+    """
     ceiling, tau, unc = CLASSES[classify(trophy)]
-    if rate0 is None:
-        # Never observed: start from a low prior for the class.
-        rate0 = 0.5 if ceiling < 10 else 2.0
-    # A high observed rate is itself evidence the trophy is early or
-    # easy: a trophy already above its class ceiling on launch night
-    # (the tutorial-style first mission every early player has) keeps
-    # a high ceiling, only diluted a little by late joiners. The cap
-    # keeps this from ever claiming a trophy stays at 100%.
+    rate0 = 100.0 * e_last / p_last if p_last > 0 else 0.0
+    if rate0 >= 99.99:
+        return p_target, unc
     if rate0 > ceiling:
         ceiling = max(ceiling, min(0.92 * rate0, 95.0))
+    # Existing cohort: logit pull toward the ceiling.
     start = logit(rate0)
     end = logit(ceiling)
-    # Fraction of the way to the ceiling covered by this horizon.
-    # Short horizons barely move; a 4.5-day horizon covers most of the
-    # way for story and easy activities, little for grinds. The same
-    # formula pulls a rate above its ceiling back down: that is the
-    # dilution of early 100%-style rates as the player base grows.
     frac = 1.0 - math.exp(-horizon_days / tau)
     centre = end + (start - end) * (1.0 - frac)
-    # History drift, applied in logit space, capped so a noisy slope
-    # can never drag the forecast far from the class model.
-    centre += max(-0.5, min(0.5, drift * horizon_days))
-    centre = max(logit(0.01), min(logit(99.99), centre))
+    e_existing = p_last * sigmoid(centre) / 100.0
+    # New cohort: tenure curve over half the horizon of exposure.
+    # The inferred time constant is shrunk toward the class constant
+    # by the earner count: with only a handful of earners, the
+    # observed rate is mostly quantisation noise (at 638 tracked
+    # players, 0.63% is four players -- four launch-night players
+    # cannot show that a 100%-completion grind is fast), so a thin
+    # history must not override the class prior. The weight is
+    # e/(e+20) on the inferred value, in log space.
+    tau_tenure = tenure_tau(rate0, ceiling, age_hours)
+    if tau_tenure is None or math.isinf(tau_tenure):
+        tau_tenure = tau
+    else:
+        weight = e_last / (e_last + 20.0)
+        tau_tenure = math.exp(weight * math.log(tau_tenure)
+                              + (1.0 - weight) * math.log(tau))
+    exposure_days = (horizon_hours / 2.0) / 24.0
+    share_new = ceiling * (1.0 - math.exp(-exposure_days / tau_tenure))
+    e_new = max(0.0, p_target - p_last) * share_new / 100.0
+    return max(e_existing + e_new, e_last), unc
+
+
+def forecast_one(trophy: dict, e_last, p_last, p_target, age_hours,
+                 horizon_days, horizon_hours, stale: bool) -> list:
+    """Five quantiles for one trophy at the target horizon."""
+    e_target, unc = forecast_counts(trophy, e_last, p_last, p_target,
+                                    age_hours, horizon_days, horizon_hours)
+    median = 100.0 * e_target / p_target if p_target > 0 else 0.01
+    centre = logit(median)
     # Spread widens with the horizon like a random walk, plus the
     # class uncertainty, plus a floor so even a 90-minute forecast is
-    # not absurdly certain. Grinds and platinum widen fastest.
+    # not absurdly certain. A stale page adds refresh uncertainty:
+    # the next refresh can move the counts a long way at once, and the
+    # quantiles must be wide enough to admit it.
     spread = 0.12 + (0.30 + unc) * math.sqrt(horizon_days)
+    if stale:
+        spread += 0.25
     spread = min(spread, 2.2)
     out = []
     prev = -1.0
@@ -275,12 +442,32 @@ def forecast_case(case: dict, name: str) -> dict:
         raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
     if not case["history"]:
         raise ValueError(f"{name} has no history")
+    _, h_target, times, players, earners = case_series(case)
+    last_read = parse_time(case["history"][-1]["at"])
+    first_read = parse_time(case["history"][0]["at"])
+    origin = parse_time(case["game"]["release_date"] + "T00:00:00Z")
+    # Age of the tracked population at the last read, and how long
+    # the page has sat frozen: the two clocks the counts model needs.
+    age_hours = hours_between(last_read, origin)
+    freeze_hours = max(0.0, (last_read - first_read).total_seconds() / 3600.0)
     horizon_days = case["horizon_minutes"] / 1440.0
+    horizon_hours = case["horizon_minutes"] / 60.0
+    stale = history_is_stale(case)
+    p_target = forecast_players(times, players, h_target, horizon_hours,
+                                stale, freeze_hours)
+    p_last = float(max(players[-1], 1))
     rows = []
     for i, trophy in enumerate(case["trophies"]):
-        rate0 = last_rate(case["history"], i)
-        drift = history_drift(case["history"], i)
-        rows.append({"id": trophy["id"], "q": forecast_one(trophy, rate0, drift, horizon_days)})
+        series = earners[i]
+        if series:
+            e_last = series[-1][1]
+        else:
+            # Never observed: start from a low prior for the class.
+            ceiling = CLASSES[classify(trophy)][0]
+            e_last = (0.5 if ceiling < 10 else 2.0) / 100.0 * p_last
+        rows.append({"id": trophy["id"], "q": forecast_one(
+            trophy, e_last, p_last, p_target, age_hours,
+            horizon_days, horizon_hours, stale)})
     return {"trophies": rows}
 
 
