@@ -66,6 +66,18 @@ anywhere. A universal trophy (median 100%) takes no dilution tail:
 its earners equal the tracked count by definition, whatever the
 count does.
 
+v5: the loss decomposition showed the spread, not the median, was
+the problem (72% spread floor, 28% median error), so v5 tightens
+the stale-path interval horizon-aware -- 0.45 down / 0.65 up at one
+refresh away, recovering toward 1 over ~six refreshes -- and splits
+the marginal share into a median share (the posterior centre) and a
+corner band. The median was already at the family median, so the
+re-centring is small (fast share 0.05 -> 0.03 only); the gain is
+almost all spread. A post-hoc rigid shift of the interval to the
+family centre looked better (0.071) but is not reproducible through
+the model's counts machinery -- the corners must stay coherent with
+the median -- and is not claimed here.
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -316,15 +328,22 @@ CLASSES = {
 # the average, and the fraction depends on how fast the trophy is:
 # an early chapter or a one-off activity is held by many casual
 # players, a story-final or grind trophy by almost none of them.
-# The values are calibrated on the two live anchors the board gives
-# (the house starter's practice loss ~1.51 with typical miss ~0.68pp,
-# and our v3's live loss 0.388 with miss 0.31pp): together they pin
-# the average post-refresh factor to about 0.20 of the last rate, with
-# fast trophies higher and slow ones at the pure-dilution floor, and
-# the three group values below are the robust centre of that family
-# (see judge-v4.py's grid: the loss is flat across the family, so no
-# sharper claim is made). The spread prices the band around them:
-# the low corner halves the share, the high corner doubles it.
+#
+# v5 SPLIT: the share now has two roles. MEDIAN_SHARE is the
+# posterior CENTRE -- the share the median uses. MARGINAL_SHARE is
+# the corner band -- the shares the low/high corners use
+# (halved/doubled below). They split because the grids showed the
+# two roles want different values for fast trophies: the fast median
+# share 0.03 (down from v4's 0.05) centres the fast median on the
+# family's fast centre factor 0.235, while the fast corners stay at
+# v4's 0.05 band. Mid/slow need no split -- their medians are
+# already at their family centres with share 0 (v4's medians sit
+# inside the flat interval of the mean absolute logit deviation, so
+# re-centring them buys nothing and breaks the interval: moving the
+# median without moving the corners pushes the floor truths out of
+# the inner quantiles, and moving the corners with it widens the
+# upside -- measured both ways in tune-v5c/v5d).
+MEDIAN_SHARE = {"fast": 0.03, "mid": 0.0, "slow": 0.0}
 MARGINAL_SHARE = {"fast": 0.05, "mid": 0.0, "slow": 0.0}
 SHARE_LOW_FRAC = 0.5
 SHARE_HIGH_MULT = 2.0
@@ -434,6 +453,36 @@ def tenure_tau(rate_pct: float, ceiling: float, age_hours: float):
     return tau_hours / 24.0
 
 
+# Refresh-posterior spread scale (v5): the stale-path interval is
+# tightened HORIZON-AWARE, and slightly asymmetrically. The
+# decomposition (judge-v5.py) measured v4's loss as 72% spread floor
+# (0.081) and only 28% median error (0.031): the median was already
+# near-optimal, the interval was ~2x wider than the refresh
+# posterior. The scale below corrects that: at a 90-minute horizon
+# (one refresh away) the downside offsets shrink to 0.45 and the
+# upside offsets to 0.65 of their v4 size -- the downside shrinks a
+# little more because the structural floor (0.165) truncates it
+# while the upside is open. The scale recovers toward 1 as the
+# horizon spans more refreshes -- uncertainty compounds with the
+# number of refreshes, about six of them (tau = 1.46 days at the
+# documented six-hour cadence) -- so a 4.5-day horizon keeps
+# ~0.97/0.98 of the v4 spread, and the final (which is what pays)
+# is barely touched. The amplitudes are set so the scale is exactly
+# 0.45/0.65 at 0.0625 days: A = (1 - scale) / exp(-0.0625/1.46).
+# Measured on the family (real model, not post-hoc): 0.0868 mean,
+# 0.941 coverage, worst member 0.1205 -- vs v4's 0.1122 / 0.982.
+SPREAD_DOWN_AMP = 0.574
+SPREAD_UP_AMP = 0.365
+SPREAD_TAU_DAYS = 1.46
+
+
+def spread_scale(horizon_days: float, down: bool) -> float:
+    """Stale-path offset scale at this horizon: 0.45 down / 0.65 up
+    at one refresh away, recovering toward 1 over ~six refreshes."""
+    amp = SPREAD_DOWN_AMP if down else SPREAD_UP_AMP
+    return 1.0 - amp * math.exp(-horizon_days / SPREAD_TAU_DAYS)
+
+
 def corner_players(p_target: float, p_last: float) -> float:
     """High leg of the player count for the spread corners: the point
     forecast grown by a quarter of its own log growth. The stale
@@ -517,9 +566,14 @@ def forecast_counts(trophy: dict, e_last: float, p_last: float,
     if stale:
         # Backlog joiners arrive with the marginal share of the
         # current rate; later joiners earn along the tenure curve.
+        # v5: the MEDIAN uses MEDIAN_SHARE (the posterior centre)
+        # while the corners use MARGINAL_SHARE (the corner band) --
+        # see the split note above. The tenure part is common to
+        # median and corners: only the backlog slice differs.
         share_group = _SHARE_GROUP[classify(trophy)]
+        share_med = MEDIAN_SHARE[share_group] * rate0
         share_point = MARGINAL_SHARE[share_group] * rate0
-        share_new = (backlog_frac * share_point
+        share_new = (backlog_frac * share_med
                      + (1.0 - backlog_frac) * share_tenure)
         share_lo = (backlog_frac * SHARE_LOW_FRAC * share_point
                     + (1.0 - backlog_frac) * share_tenure)
@@ -601,6 +655,15 @@ def forecast_one(trophy: dict, e_last, p_last, p_target, p_hi,
                0.0,
                0.674 * spread + 0.5 * up_extra,
                1.645 * spread + up_extra]
+    if stale:
+        # v5: shrink the stale-path offsets by the refresh-posterior
+        # scale -- the downside by more than the upside, because the
+        # structural floor truncates the downside while the upside is
+        # open. The scale recovers toward 1 with the horizon, so the
+        # long-horizon (final) spread is barely touched. The median
+        # (offset 0) is never scaled.
+        offsets = [off * spread_scale(horizon_days, off < 0)
+                   if off != 0.0 else 0.0 for off in offsets]
     out = []
     prev = -1.0
     for off in offsets:
