@@ -106,6 +106,23 @@ medians and the smoke test are identical to v6, because the branch
 never fires there. This is still a bet on the tight region, only a
 sharper one -- and it is final-neutral and prize-neutral like v6.
 
+v8: the stale-branch quantiles switch from the group-constant region
+posterior (v7) to the integer-reconstruction posterior (f1p). The
+04:30Z refresh's earners must be integers summing to 4,276 exactly
+(the 100% trophy takes 3,868, so the other 54 sum to 408), and every
+printed rate at 638 players implies an integer old-earner count, so
+each trophy's refresh rate lives on a tight integer grid. Per
+(group, old earners) cell, the five quantiles are the marginal
+quantiles of the printed refresh rate across the 20 region points
+(uniform weighting), with a nearest-cell fallback and the v7
+posterior as the last resort. On the continuous region it scores
+~0.038 vs v7's ~0.024, but on integer truths -- the only kind the
+real truth can be -- it beats v7 on every test (leave-one-out 0.029
+vs 0.041, jittered integer truths, family integerised 10/10). The
+final-horizon medians and the smoke test are identical to v7,
+because the branch never fires there; still final-neutral and
+prize-neutral.
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -391,6 +408,31 @@ POST_Q = {
     "fast": {0.05: 0.304, 0.25: 0.323, 0.5: 0.335, 0.75: 0.355, 0.95: 0.376},
     "mid": {0.05: 0.165, 0.25: 0.165, 0.5: 0.165, 0.75: 0.175, 0.95: 0.185},
     "slow": {0.05: 0.165, 0.25: 0.165, 0.5: 0.165, 0.75: 0.175, 0.95: 0.185},
+}
+
+# Integer-reconstruction refresh rates (v8): per (group, old earners)
+# cell, the marginal quantiles of the printed refresh rate
+# round(100*E'/3868, 2) across the 20 region points, uniform
+# weighting. Each region point's E' vector is the rounded implied
+# earners E_old * (3868/638) * f_group, adjusted to sum exactly 408
+# (the public rules' 4,276 total minus the 100% trophy's 3,868).
+# The cells cover every (group, E_old) the practice histories show;
+# unseen cells fall back to the nearest E_old in the same group.
+INT_Q = {
+    ("fast", 5): [0.2585, 0.26, 0.28, 0.28, 0.28],
+    ("fast", 6): [0.28, 0.31, 0.34, 0.36, 0.36],
+    ("fast", 7): [0.34, 0.36, 0.39, 0.39, 0.41],
+    ("fast", 8): [0.3885, 0.41, 0.44, 0.4475, 0.471],
+    ("fast", 10): [0.489, 0.5125, 0.54, 0.57, 0.571],
+    ("fast", 13): [0.6185, 0.67, 0.7, 0.75, 0.78],
+    ("mid", 4): [0.1, 0.1, 0.1, 0.1, 0.1],
+    ("mid", 5): [0.13, 0.13, 0.13, 0.13, 0.16],
+    ("mid", 6): [0.16, 0.16, 0.16, 0.16, 0.18],
+    ("mid", 7): [0.18, 0.18, 0.18, 0.21, 0.23],
+    ("slow", 4): [0.1, 0.1, 0.1, 0.1, 0.13],
+    ("slow", 5): [0.13, 0.13, 0.13, 0.13, 0.18],
+    ("slow", 7): [0.18, 0.18, 0.18, 0.21, 0.23],
+    ("slow", 8): [0.21, 0.21, 0.21, 0.23, 0.26],
 }
 
 MEDIAN_SHARE = {"fast": 0.216, "mid": 0.0, "slow": 0.0}
@@ -704,27 +746,29 @@ def forecast_one(trophy: dict, e_last, p_last, p_target, p_hi,
                0.674 * spread + 0.5 * up_extra,
                1.645 * spread + up_extra]
     if stale and backlog_frac >= 0.999 and median < 99.99:
-        # v7: the region posterior prices the first refresh directly.
-        # When the whole horizon is one refresh, the five quantiles
-        # are the posterior quantiles of the refresh rate (rate0 *
-        # POST_Q[group][tau]), with each non-median offset floored
-        # at a quarter of the v6 offset -- a hedge against per-trophy
-        # variation inside the groups, which the group-constant
-        # region cannot see. The median is the posterior median.
-        # Fires only on the stale branch at backlog_frac 1, which
-        # never happens on the final case (non-stale) or the
-        # long-horizon sim (backlog_frac ~0.08), so the final is
-        # identical to v6.
+        # v8 (f1p): integer reconstruction prices the first refresh.
+        # The five quantiles are the integer-posterior quantiles of
+        # the refresh rate for this trophy's (group, E_old) cell --
+        # E_old recovered from the last read, E' integer, sum 408
+        # exact. Fires only when the whole horizon is one refresh;
+        # the final case is non-stale and the long-horizon sim has
+        # backlog_frac ~0.08, so both keep the v7 behaviour exactly.
         rate0 = 100.0 * e_last / p_last if p_last > 0 else 0.0
+        grp0 = _SHARE_GROUP[classify(trophy)]
+        e_old = int(round(e_last))
         grp = _SHARE_GROUP[classify(trophy)]
-        post = [logit(rate0 * POST_Q[grp][tau]) - centre
-                for tau in LEVELS]
-        cur = [off * spread_scale(horizon_days, off < 0)
-               if off != 0.0 else 0.0 for off in offsets]
-        offsets = [post[i] if i == 2 else
-                   (post[i] if abs(post[i]) >= 0.25 * abs(cur[i])
-                    else cur[i] * 0.25)
-                   for i in range(5)]
+        cell = INT_Q.get((grp, e_old))
+        if cell is None:
+            # unseen (group, E_old): nearest E_old in the same group
+            same = sorted(k[1] for k in INT_Q if k[0] == grp)
+            e2 = min(same, key=lambda x: abs(x - e_old)) if same else None
+            cell = INT_Q[(grp, e2)] if e2 is not None else None
+        if cell is None:
+            post = [logit(rate0 * POST_Q[grp][tau]) - centre
+                    for tau in LEVELS]
+        else:
+            post = [logit(cell[i]) - centre for i in range(5)]
+        offsets = post
     elif stale:
         # v5: shrink the stale-path offsets by the refresh-posterior
         # scale -- the downside by more than the upside, because the
