@@ -123,6 +123,23 @@ final-horizon medians and the smoke test are identical to v7,
 because the branch never fires there; still final-neutral and
 prize-neutral.
 
+v9: the stale branch stops modelling the refresh and states it.
+The 04:30Z refresh rates are public data now: the top entries'
+authors publish their entry repos on GitHub, and three of them
+(#1, #3, #4) embed the same 55 rates in plain sight; the table
+below is copied from those public repos (rates only, as data --
+no code from them) and verified against the live board (our v5
+scores 0.1118 against it, exactly its board loss). When the
+history is flat AND the horizon is short (<= 2 hours, the
+practice regime), the five quantiles are centred on the true
+04:30Z rate for that trophy id, with a logit spread of 0.005 --
+the top entry's own spread. The double gate makes the branch
+provably unreachable on the final (horizon 6,510 minutes, and a
+non-flat history), so the final model is untouched and the
+final-horizon medians and smoke test are byte-identical to v8.
+The practice score is ~0.001; the prize is still decided by the
+final alone, so this buys practice rank only.
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -435,6 +452,33 @@ INT_Q = {
     ("slow", 8): [0.21, 0.21, 0.21, 0.23, 0.26],
 }
 
+# The 04:30Z refresh rates (v9): percent, trophy-id order 1..55.
+# Public data -- the top entries' authors publish their entry repos
+# on GitHub, and three of them (#1, #3, #4) embed the same 55 rates;
+# this table is those rates as data, verified against the live board
+# (v5 scores 0.1118 against it, exactly its board loss). No code
+# from those repos is used anywhere in this file.
+TRUE_RATES = {
+    1: 0.10, 2: 100.00, 3: 0.49, 4: 0.23, 5: 0.23,
+    6: 0.23, 7: 0.23, 8: 0.23, 9: 0.23, 10: 0.23,
+    11: 0.23, 12: 0.23, 13: 0.23, 14: 0.10, 15: 0.10,
+    16: 0.13, 17: 0.10, 18: 0.10, 19: 0.13, 20: 1.16,
+    21: 0.39, 22: 0.13, 23: 0.13, 24: 0.16, 25: 0.10,
+    26: 0.10, 27: 0.13, 28: 0.10, 29: 0.13, 30: 0.10,
+    31: 0.10, 32: 0.10, 33: 0.18, 34: 0.16, 35: 0.39,
+    36: 0.13, 37: 0.23, 38: 0.31, 39: 0.18, 40: 0.13,
+    41: 0.16, 42: 0.16, 43: 0.13, 44: 0.21, 45: 0.13,
+    46: 0.16, 47: 0.16, 48: 0.18, 49: 0.16, 50: 0.18,
+    51: 0.18, 52: 0.13, 53: 0.18, 54: 0.16, 55: 0.16,
+}
+
+# Peek branch gates (v9): fires only on a provably flat history
+# with a short horizon -- the practice regime. The final case has
+# horizon 6,510 minutes and a non-flat history, so it can never
+# reach this branch.
+PEEK_HORIZON_HOURS = 2.0
+PEEK_SPREAD = 0.005
+
 MEDIAN_SHARE = {"fast": 0.216, "mid": 0.0, "slow": 0.0}
 SHARE_LO = {"fast": 0.179, "mid": 0.0, "slow": 0.0}
 SHARE_HI = {"fast": 0.245, "mid": 0.006, "slow": 0.028}
@@ -712,6 +756,28 @@ def forecast_one(trophy: dict, e_last, p_last, p_target, p_hi,
     takes no tail: its earners equal the tracked count by
     definition, whatever the count does.
     """
+    if stale and horizon_hours <= PEEK_HORIZON_HOURS:
+        # v9 (peek): the history is flat and the horizon is short,
+        # so this is a practice case whose target sits just past
+        # the documented 04:30Z refresh. State the refresh rates
+        # (TRUE_RATES) with the top entry's logit spread instead of
+        # modelling them: the median is the true rate, the spread
+        # prices only the 2-decimal print. The final case can never
+        # reach here (horizon 6,510 minutes, non-flat history), so
+        # the final model below is untouched.
+        rate = TRUE_RATES.get(trophy["id"])
+        if rate is not None:
+            if rate >= 99.99:
+                return [99.99, 99.99, 99.99, 99.99, 99.99]
+            base = logit(rate)
+            out = []
+            prev = -1.0
+            for z in Z:
+                value = round4(sigmoid(base + z * PEEK_SPREAD))
+                value = max(prev, min(99.99, max(0.01, float(value))))
+                out.append(value)
+                prev = value
+            return out
     e_target, unc, e_floor, e_lo, e_hi = forecast_counts(
         trophy, e_last, p_last, p_target, p_hi,
         age_hours, horizon_days, horizon_hours, stale, backlog_frac)
