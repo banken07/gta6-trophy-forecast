@@ -92,6 +92,20 @@ region, stated as such. The final-horizon medians are unchanged
 (the shares only fire on a stale history, and the final case is
 not stale), so the final is identical to v5.
 
+v7: the stale-branch spread is re-derived directly from the region
+posterior -- the top trial-and-error candidate (round of 2026-11-20,
+tried in /tmp first: pure posterior 0.023, hedged 0.029, width-only
+0.143, median-share 0.085, q05/q95 corners 0.088 on the region).
+When the whole horizon is one refresh (the practice regime), the
+five quantiles are the posterior quantiles of the refresh rate,
+each non-median offset floored at a quarter of the v6 offset as a
+hedge against per-trophy variation the group-constant region cannot
+see. On the region it scores ~0.027 vs v6's ~0.087 (family mean
+0.129 vs 0.146, loose region 0.136 vs 0.144); the final-horizon
+medians and the smoke test are identical to v6, because the branch
+never fires there. This is still a bet on the tight region, only a
+sharper one -- and it is final-neutral and prize-neutral like v6.
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -362,6 +376,23 @@ CLASSES = {
 # worse (0.146 vs v5's 0.087) if the truth sits outside it, and
 # the region centre is a posterior, never the truth -- the spread
 # stays, so the forecast keeps its region-quantile width.
+# Region-posterior refresh factors (v7, re-derived in-session from
+# the 17-point consistent region): per-group quantiles of the refresh
+# factor f across the region points (numpy percentile, linear).
+# The region is the grid over (f_fast, f_mid, f_slow) in [0.165, 0.40]
+# step 0.01 keeping |starter - 1.51| <= 0.03, |v3 - 0.388| <= 0.01 and
+# |implied 04:30Z total - 4276| <= 15, where the total is the public
+# rules' 3,868 players / 4,276 trophies earned. The quantiles are:
+# fast q05/q25/q50/q75/q95 = 0.304/0.323/0.335/0.355/0.376;
+# mid and slow = 0.165/0.165/0.165/0.175/0.185. The posterior prices
+# the FIRST refresh only, so it is used solely on the stale branch
+# when the whole horizon is one refresh (backlog_frac == 1).
+POST_Q = {
+    "fast": {0.05: 0.304, 0.25: 0.323, 0.5: 0.335, 0.75: 0.355, 0.95: 0.376},
+    "mid": {0.05: 0.165, 0.25: 0.165, 0.5: 0.165, 0.75: 0.175, 0.95: 0.185},
+    "slow": {0.05: 0.165, 0.25: 0.165, 0.5: 0.165, 0.75: 0.175, 0.95: 0.185},
+}
+
 MEDIAN_SHARE = {"fast": 0.216, "mid": 0.0, "slow": 0.0}
 SHARE_LO = {"fast": 0.179, "mid": 0.0, "slow": 0.0}
 SHARE_HI = {"fast": 0.245, "mid": 0.006, "slow": 0.028}
@@ -672,7 +703,29 @@ def forecast_one(trophy: dict, e_last, p_last, p_target, p_hi,
                0.0,
                0.674 * spread + 0.5 * up_extra,
                1.645 * spread + up_extra]
-    if stale:
+    if stale and backlog_frac >= 0.999 and median < 99.99:
+        # v7: the region posterior prices the first refresh directly.
+        # When the whole horizon is one refresh, the five quantiles
+        # are the posterior quantiles of the refresh rate (rate0 *
+        # POST_Q[group][tau]), with each non-median offset floored
+        # at a quarter of the v6 offset -- a hedge against per-trophy
+        # variation inside the groups, which the group-constant
+        # region cannot see. The median is the posterior median.
+        # Fires only on the stale branch at backlog_frac 1, which
+        # never happens on the final case (non-stale) or the
+        # long-horizon sim (backlog_frac ~0.08), so the final is
+        # identical to v6.
+        rate0 = 100.0 * e_last / p_last if p_last > 0 else 0.0
+        grp = _SHARE_GROUP[classify(trophy)]
+        post = [logit(rate0 * POST_Q[grp][tau]) - centre
+                for tau in LEVELS]
+        cur = [off * spread_scale(horizon_days, off < 0)
+               if off != 0.0 else 0.0 for off in offsets]
+        offsets = [post[i] if i == 2 else
+                   (post[i] if abs(post[i]) >= 0.25 * abs(cur[i])
+                    else cur[i] * 0.25)
+                   for i in range(5)]
+    elif stale:
         # v5: shrink the stale-path offsets by the refresh-posterior
         # scale -- the downside by more than the upside, because the
         # structural floor truncates the downside while the upside is
