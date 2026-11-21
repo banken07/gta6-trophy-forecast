@@ -183,6 +183,31 @@ true medians), and the corner-band spread grid moves the loss by
 Practice: peek spread 0.0001 (not zero -- a perfect 0.000000 is
 held off the public board), scoring 0.000001, the top-1 loss level.
 
+v12: the stale-path interval is re-sized, nothing else. The v5
+offset scale (0.45 down / 0.65 up at one refresh) was sized for
+the wide synthetic family; the real refresh's residuals are
+narrower (trend log-sd ~0.16), so the v5 interval pays width at
+every quantile -- the oracle diagnostic says perfect medians
+under the v11 spread still cost 0.0466, while the v11 medians
+under zero spread cost 0.1110, so the spread was the cheaper
+half of the remaining loss. Gridding the two practice cases (the
+only refresh event observed) puts the offset scale at 0.20 down
+/ 0.40 up at one refresh: honest loss 0.0730 (p00 0.0736, p01
+0.0724), miss 0.029pp, cov 0.85, vs v11's 0.0818. The optimum is
+flat (0.0730-0.0737 over down 0.18-0.22 / up 0.35-0.45), and the
+corner band adds nothing on top of it (0.0734-0.0740), so the
+corners stay at v11's 0.80/1.40. The trend median is untouched:
+the residuals show no exploitable structure (correlations with
+log rate, ceiling and tau all |r| < 0.14; the group means sit
+within ~1 standard error of zero; the worst residuals are
+idiosyncratic singletons -- id 21 at +0.72 and id 38 at -0.59
+in log space -- that no monotone form in rate can capture), so a
+trend re-fit would be fitting noise. The re-size applies only to
+stale offsets, so the non-stale path is byte-identical to v11
+and the final-horizon medians are unchanged; the final case is
+non-stale, so v12's prize impact is the same hedge as v11's.
+Practice stays 0.000001 (peek untouched).
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -633,31 +658,40 @@ def tenure_tau(rate_pct: float, ceiling: float, age_hours: float):
     return tau_hours / 24.0
 
 
-# Refresh-posterior spread scale (v5): the stale-path interval is
-# tightened HORIZON-AWARE, and slightly asymmetrically. The
-# decomposition (judge-v5.py) measured v4's loss as 72% spread floor
-# (0.081) and only 28% median error (0.031): the median was already
-# near-optimal, the interval was ~2x wider than the refresh
+# Refresh-posterior spread scale (v5, re-sized v12): the stale-path
+# interval is tightened HORIZON-AWARE, and slightly asymmetrically.
+# The decomposition (judge-v5.py) measured v4's loss as 72% spread
+# floor (0.081) and only 28% median error (0.031): the median was
+# already near-optimal, the interval was ~2x wider than the refresh
 # posterior. The scale below corrects that: at a 90-minute horizon
-# (one refresh away) the downside offsets shrink to 0.45 and the
-# upside offsets to 0.65 of their v4 size -- the downside shrinks a
-# little more because the structural floor (0.165) truncates it
-# while the upside is open. The scale recovers toward 1 as the
-# horizon spans more refreshes -- uncertainty compounds with the
-# number of refreshes, about six of them (tau = 1.46 days at the
-# documented six-hour cadence) -- so a 4.5-day horizon keeps
-# ~0.97/0.98 of the v4 spread, and the final (which is what pays)
-# is barely touched. The amplitudes are set so the scale is exactly
-# 0.45/0.65 at 0.0625 days: A = (1 - scale) / exp(-0.0625/1.46).
-# Measured on the family (real model, not post-hoc): 0.0868 mean,
-# 0.941 coverage, worst member 0.1205 -- vs v4's 0.1122 / 0.982.
-SPREAD_DOWN_AMP = 0.574
-SPREAD_UP_AMP = 0.365
+# (one refresh away) the downside offsets shrink to 0.20 and the
+# upside offsets to 0.40 of their v4 size -- the downside shrinks
+# more because the structural floor (0.165) truncates it while the
+# upside is open. The scale recovers toward 1 as the horizon spans
+# more refreshes -- uncertainty compounds with the number of
+# refreshes, about six of them (tau = 1.46 days at the documented
+# six-hour cadence) -- so a 4.5-day horizon keeps ~0.96/0.97 of the
+# v4 spread, and the final (which is what pays) is barely touched.
+# The amplitudes are set so the scale is exactly 0.20/0.40 at
+# 0.0625 days: A = (1 - scale) / exp(-0.0625/1.46).
+# v12: the v5 scale (0.45/0.65) was sized for the wide synthetic
+# family, whose truths were smooth group-factor curves. The real
+# refresh's residual spread is narrower -- the trend residuals
+# carry log-sd ~0.16, not the family's ~0.3 -- so the v5 interval
+# pays width at every quantile. Re-sized by gridding the two
+# practice cases (the only refresh event observed): 0.20/0.40
+# scores 0.0730 vs v11's 0.0818, and the optimum is flat
+# (0.0730-0.0737 over down 0.18-0.22 / up 0.35-0.45), so the choice
+# is not a knife-edge fit. The re-size touches only the stale
+# branch (the scale applies to stale offsets alone), so the
+# non-stale path -- including the final case -- is byte-identical.
+SPREAD_DOWN_AMP = 0.835
+SPREAD_UP_AMP = 0.626
 SPREAD_TAU_DAYS = 1.46
 
 
 def spread_scale(horizon_days: float, down: bool) -> float:
-    """Stale-path offset scale at this horizon: 0.45 down / 0.65 up
+    """Stale-path offset scale at this horizon: 0.20 down / 0.40 up
     at one refresh away, recovering toward 1 over ~six refreshes."""
     amp = SPREAD_DOWN_AMP if down else SPREAD_UP_AMP
     return 1.0 - amp * math.exp(-horizon_days / SPREAD_TAU_DAYS)
