@@ -235,6 +235,37 @@ medians are unchanged; the final case is non-stale, so v13's
 prize impact is the same hedge as v12's. Practice stays
 0.000001 (peek untouched).
 
+v14: the stale-branch trend group for one trophy is fixed, nothing
+else. The diagnostics (diag-v14.py) showed the loss is dominated
+by two idiosyncratic singletons (id 21 at -0.73 and id 38 at +0.60
+in logit, ~30% of the total between them) and that the trend is
+already aggregate-exact (the model's implied aggregate earners
+are 4,272 vs the public 4,276 on p01, 0.999 -- a global F_MED
+shift would break that, and gridding it confirms: 0.97x scores
+0.0702, 1.03x scores 0.0742). Id 21, "Complete an arcade game",
+was classed story_mission by classify()'s "complete " catch-all,
+but an arcade game is the activity_easy class's defining example,
+so its refresh factor used the mid group (0.200) instead of fast
+(0.250). The fix is scoped to the stale branch only: the trend
+group now comes from _trend_classify(), which checks the activity
+word lists before the catch-all; classify() itself is untouched,
+so the non-stale path -- including the final case -- stays
+byte-identical (smoke test). Over the 55 trophies exactly one
+group flips (id 21, mid -> fast); its loss falls 0.663 -> 0.423
+and the honest loss falls to 0.0663 (p00 0.0669, p01 0.0657),
+miss 0.028pp, cov 0.93 unchanged, vs v13's 0.0706. Rejected in
+v14: a margin floor clamp on the downside quantiles (best 0.0702,
+and margins below 0.08 collapse p00 coverage to 0.73 -- the
+scored truth sits up to ~0.07 logit below the model's exact
+floor from printed rounding plus the player forecast error, so
+the safe window is a knife-edge for a 0.0004 gain); a trend
+exponent re-fit (0.7 is the optimum: 0.6 ties at 0.0706 with
+worse coverage, 0.5/0.8/0.9 are worse). Id 38 stays as it is:
+"Challenging Tank" gives no textual basis for reclassification,
+and moving it on its residual alone would be fitting the answer.
+The final-horizon medians and the smoke test are identical to
+v13, because the change never fires off the stale branch.
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -751,6 +782,74 @@ def corner_players(p_target: float, p_last: float) -> float:
     return p_target * (p_target / p_last) ** 0.25
 
 
+def _trend_classify(trophy: dict) -> str:
+    """classify() with one ordering fix, used ONLY for the stale-branch
+    trend-group lookup (forecast_counts' stale block). The activity
+    word lists are checked BEFORE the "complete " catch-all, so a
+    specific content signal outranks the prefix heuristic. The
+    catch-all's own comment says any other "Complete ..." trophy is
+    a named mission beat -- but "Complete an arcade game" is not a
+    mission beat: "arcade game" is the activity_easy class's own
+    defining example, in its word list and its docstring. The
+    mission-word check above still runs first, so genuine missions
+    ("Complete the final mission", "Complete Breakfast Run") are
+    untouched. Over the 55 trophies this flips exactly one class:
+    id 21, story_mission/mid -> activity_easy/fast. classify()
+    itself is deliberately NOT changed: it also sets the class
+    ceiling/tau/unc used on the non-stale path, and the non-stale
+    path must stay byte-identical, so the fix is scoped to the
+    trend group, which only the stale branch reads."""
+    tier = str(trophy.get("tier", "")).lower()
+    text = str(trophy.get("description", "")).lower()
+    name = str(trophy.get("name", "")).lower()
+    if tier == "platinum":
+        return "platinum"
+    if any(word in text for word in _GRIND_WORDS):
+        # The very longest grinds get the hardest class; the rest the mid one.
+        if any(w in text for w in ("100% completion", "250 stunts", "gold medal")):
+            return "grind_hard"
+        return "grind_mid"
+    if "chapter 1" in text:
+        return "chapter_early"
+    if "chapter 2" in text:
+        return "chapter_early"
+    if "chapter 3" in text:
+        return "chapter_mid"
+    if "chapter 4" in text:
+        return "chapter_late"
+    if "final mission" in text and "stranger" not in text:
+        # The story's final mission, not a stranger strand's.
+        if "andy" in text or "kenton" in text or "billy" in text \
+                or "randy" in text or "tyrone" in text:
+            return "strand_final"
+        return "story_final"
+    if "final mission for" in text:
+        return "strand_final"
+    if text.startswith("complete ") and ("mission" in text or "run" in text
+                                         or "heist" in text or "play" in text
+                                         or "takedown" in text or "operation" in text
+                                         or "headliners" in text or "dwnfall" in text):
+        return "story_mission"
+    if any(word in text for word in ("win ", "beat ", "bowl", "arcade game",
+                                     "cocktail", "drive-by", "melee")):
+        return "activity_easy"
+    if any(word in text for word in ("rob ", "escape", "wanted level",
+                                     "discover", "explore", "earn $",
+                                     "spend $", "purchase", "register",
+                                     "take down", "hunt", "meditate",
+                                     "smash", "enjoy", "follow-through")):
+        return "activity_mid"
+    if text.startswith("complete "):
+        # Any other "Complete ..." trophy is a named mission beat.
+        return "story_mission"
+    # Unknown phrasing: a bronze one-off is the safest middle guess.
+    if tier == "gold":
+        return "story_final"
+    if tier == "silver":
+        return "activity_mid"
+    return "activity_easy"
+
+
 def forecast_counts(trophy: dict, e_last: float, p_last: float,
                     p_target: float, p_hi: float, age_hours: float,
                     horizon_days: float, horizon_hours: float,
@@ -829,7 +928,7 @@ def forecast_counts(trophy: dict, e_last: float, p_last: float,
         # only the backlog slice differs. The old halved/doubled
         # band and its cap are gone: SHARE_HI is already explicit
         # and below the old cap for every group.
-        share_group = _SHARE_GROUP[classify(trophy)]
+        share_group = _SHARE_GROUP[_trend_classify(trophy)]
         # v11: the backlog slice's median share is the trend share --
         # the share that makes the backlog slice alone land on the
         # trend factor, given the model's own existing cohort and
