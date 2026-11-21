@@ -266,6 +266,29 @@ and moving it on its residual alone would be fitting the answer.
 The final-horizon medians and the smoke test are identical to
 v13, because the change never fires off the stale branch.
 
+v15: two small stale-branch fixes the v15 investigation found
+genuine but sub-bar, ported here so the version exists as a real
+candidate. (1) The frozen span is measured from the house's
+documented first probe (2026-11-18T23:48Z, competition.yaml),
+not from the case's first read (23:50:49Z, three minutes into
+the freeze): the old span made p00's refresh jump 5.94 instead
+of the documented 6.06 and its structural floor 2% high, which
+is exactly why p00 scored worse than p01 (p01's jump is capped,
+so it was unaffected). (2) A universal trophy (median 100%)
+returns [100.0]*5 on a stale history: forecast_counts already
+asserts its earners equal the tracked count, so spreading its
+quantiles below 100% contradicts the median's own assertion.
+Together they move the honest loss 0.0663 -> 0.0656 (p00 0.0657,
+p01 0.0656) with coverage 0.93 -> 0.95 -- a real gain on both
+metrics, but noise-scale (-1.0%) and below the <0.063 bar, so
+this is a marginal version, not a breakthrough. The knife-edge
+margin floor clamp the grid also found (0.0652 with it) is
+deliberately NOT included: v14 already rejected it for
+fragility. Both fixes are stale-gated, so the non-stale path --
+including the final case -- stays byte-identical, and the
+final-horizon medians are unchanged. Practice stays 0.000001
+(peek untouched).
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -402,6 +425,11 @@ def history_is_stale(case: dict) -> bool:
 # continues at the diminishing power-law pace of a launch week
 # (doubling slows as the week goes on). Both legs are capped so a
 # long horizon can never turn the prior into fantasy.
+STALE_FIRST_PROBE_HOURS = -0.2  # the house's first probe, 2026-11-18T23:48Z
+# (competition.yaml): the page was already frozen then, 12 minutes before
+# release midnight; the case's first read (23:50:49Z) is 3 minutes into
+# the freeze, so the frozen span at a target runs from the first probe,
+# not the first read. Only the stale branch reads freeze_hours.
 STALE_GAMMA = 0.383
 STALE_REFRESH_HOURS = 6.0
 STALE_JUMP_CAP = 6.06  # documented launch-night refresh 638 -> 3868
@@ -1021,6 +1049,12 @@ def forecast_one(trophy: dict, e_last, p_last, p_target, p_hi,
         trophy, e_last, p_last, p_target, p_hi,
         age_hours, horizon_days, horizon_hours, stale, backlog_frac)
     median = 100.0 * e_target / p_target if p_target > 0 else 0.01
+    if stale and median >= 99.99:
+        # A universal trophy's rate is 100% by the model's own
+        # assertion (forecast_counts returns earners == tracked
+        # count), so a spread below 100% contradicts the median.
+        # Stale-gated: the non-stale path stays byte-identical.
+        return [100.0, 100.0, 100.0, 100.0, 100.0]
     centre = logit(median)
     # Core spread: widens with the horizon like a random walk, plus
     # the class uncertainty, plus a floor so even a 90-minute
@@ -1094,7 +1128,8 @@ def forecast_case(case: dict, name: str) -> dict:
     # before the checkpoint, and the page sat frozen through it.
     age_hours = hours_between(last_read, origin)
     checkpoint = parse_time(case["target"]) - timedelta(minutes=case["horizon_minutes"])
-    freeze_hours = max(0.0, (checkpoint - first_read).total_seconds() / 3600.0)
+    freeze_start = min(first_read, origin + timedelta(hours=STALE_FIRST_PROBE_HOURS))
+    freeze_hours = max(0.0, (checkpoint - freeze_start).total_seconds() / 3600.0)
     horizon_days = case["horizon_minutes"] / 1440.0
     horizon_hours = case["horizon_minutes"] / 60.0
     stale = history_is_stale(case)
