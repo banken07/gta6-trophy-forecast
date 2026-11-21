@@ -302,12 +302,10 @@ import math
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
@@ -1183,15 +1181,19 @@ def validate(forecast: dict, case: dict, name: str) -> None:
 
 
 def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        validate(forecast, case, path.name)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for name in sorted(fn for fn in os.listdir(INPUT_DIR) if fn.endswith(".in")):
+        path = os.path.join(INPUT_DIR, name)
+        with open(path, encoding="utf-8") as f:
+            case = json.loads(f.read())
+        forecast = forecast_case(case, name)
+        validate(forecast, case, name)
         text = json.dumps(forecast, separators=(",", ":")) + "\n"
         if len(text.encode("utf-8")) > 65536:
-            raise ValueError(f"{path.name}: output over the 65,536 byte cap")
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(text, encoding="utf-8")
+            raise ValueError(f"{name}: output over the 65,536 byte cap")
+        stem = os.path.splitext(name)[0]
+        with open(os.path.join(OUTPUT_DIR, stem + ".out"), "w", encoding="utf-8") as f:
+            f.write(text)
 
 
 if __name__ == "__main__":
