@@ -208,6 +208,33 @@ and the final-horizon medians are unchanged; the final case is
 non-stale, so v12's prize impact is the same hedge as v11's.
 Practice stays 0.000001 (peek untouched).
 
+v13: the stale-path interval is widened per group, asymmetrically
+for fast (down x2.0 / up x1.5; mid and slow stay at 1.0). The
+trend residuals are not equally dispersed across groups (log-sd
+fast 0.222 / mid 0.168 / slow 0.076): fast trophies are held by
+many casual late-syncers whose sync timing is idiosyncratic, so
+their refresh is least predictable, while slow trophies are held
+by few (often exactly zero new earners at a refresh). Fast is
+widened more on the downside because its largest errors are
+negative. Honest loss 0.0706 (p00 0.0712, p01 0.0700), miss
+0.029pp, cov 0.93, vs v12's 0.0730 / cov 0.85 -- a small real gain
+on both cases with much better coverage, but below the <0.068
+bar, so this is a modest improvement, not a clear win. Two other
+ideas were tested and rejected: a floor clamp on the downside
+quantiles (0.0784, coverage collapses to 0.56 -- the scored truth
+is the two-decimal printed rate, which sits below the exact
+earner floor, and p00's model player count is 2% low, so
+clamping uncovers rows it should cover) and a rate-dependent
+spread (0.0719-0.0721, worse than the group scale). The trend
+median is untouched: the residuals show no exploitable structure
+(v12), and the oracle floor with perfect medians under the v12
+spread is 0.0277, so the remaining loss is mostly median error
+the spread cannot fix. The change is stale-gated, so the
+non-stale path is byte-identical to v12 and the final-horizon
+medians are unchanged; the final case is non-stale, so v13's
+prize impact is the same hedge as v12's. Practice stays
+0.000001 (peek untouched).
+
 One special case: a trophy at 100% (every tracked player holds it,
 to the two decimals Exophase prints) is earned on arrival -- new
 players hold it as fast as they appear in the count -- so its
@@ -541,6 +568,21 @@ TREND_F_MED = {"fast": 0.250, "mid": 0.200, "slow": 0.203}
 # the share.
 CORNER_LO_FRAC = 0.80
 CORNER_HI_FRAC = 1.40
+
+# v13: per-group stale-offset multipliers, asymmetric for fast.
+# The refresh residuals' log-sd by group (fast 0.222 / mid 0.168 /
+# slow 0.076, measured on the two practice cases): fast trophies
+# are held by many casual late-syncers whose sync timing is
+# idiosyncratic, slow trophies by few (often exactly zero new
+# earners at a refresh). The interval is widened where the refresh
+# is least predictable; mid and slow stay at 1.0 (gridded: widening
+# mid or narrowing slow both scored worse). Fast is widened more
+# on the downside than the upside (its worst errors are negative:
+# id 38 at -0.59, id 4 at -0.29, id 16 at -0.28 in logit, against
+# +0.28/+0.25 up). The optimum is flat (fast 2.0/1.5, 2.5/1.5 and
+# 2.0/2.0 all score 0.0706-0.0713), so this is not a knife-edge fit.
+GROUP_SCALE_D = {"fast": 2.0, "mid": 1.0, "slow": 1.0}
+GROUP_SCALE_U = {"fast": 1.5, "mid": 1.0, "slow": 1.0}
 
 
 def trend_factor(group: str, rate0: float) -> float:
@@ -916,7 +958,16 @@ def forecast_one(trophy: dict, e_last, p_last, p_target, p_hi,
         # open. The scale recovers toward 1 with the horizon, so the
         # long-horizon (final) spread is barely touched. The median
         # (offset 0) is never scaled.
+        # v13: the offsets are also widened per group, asymmetrically
+        # for fast (GROUP_SCALE_D/U above). The trend residuals are
+        # not equally dispersed across groups, so the interval is
+        # widened where the refresh is least predictable and left
+        # alone where it is nearly exact. Stale-gated, so the
+        # non-stale path -- including the final case -- is untouched.
+        group = _SHARE_GROUP[classify(trophy)]
         offsets = [off * spread_scale(horizon_days, off < 0)
+                   * (GROUP_SCALE_D[group] if off < 0
+                      else GROUP_SCALE_U[group])
                    if off != 0.0 else 0.0 for off in offsets]
     out = []
     prev = -1.0
